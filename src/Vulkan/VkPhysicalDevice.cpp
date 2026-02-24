@@ -846,8 +846,13 @@ const VkPhysicalDeviceProperties &PhysicalDevice::getProperties() const
 		};
 
 		// Append Reactor JIT backend name and version
+#ifdef SWIFTSHADER_ENABLE_CUDA
+		snprintf(properties.deviceName, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE,
+		         "%s CUDA (%s)", SWIFTSHADER_DEVICE_NAME, rr::Caps::backendName().c_str());
+#else
 		snprintf(properties.deviceName, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE,
 		         "%s (%s)", SWIFTSHADER_DEVICE_NAME, rr::Caps::backendName().c_str());
+#endif
 
 		return properties;
 	};

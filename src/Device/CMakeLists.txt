@@ -68,7 +68,7 @@ target_include_directories(vk_device
 
 target_compile_options(vk_device
     PRIVATE
-        ${ROOT_PROJECT_COMPILE_OPTIONS}
+        $<$<COMPILE_LANGUAGE:C,CXX>:${ROOT_PROJECT_COMPILE_OPTIONS}>
 )
 
 target_link_options(vk_device
@@ -81,3 +81,14 @@ target_link_libraries(vk_device
         vk_pipeline
         $<$<BOOL:${SWIFTSHADER_ENABLE_ASTC}>:astc-encoder>
 )
+
+if(CMAKE_CUDA_COMPILER)
+    target_sources(vk_device PRIVATE
+        CudaTraversal.cu
+        CudaRasterizer.cpp
+    )
+    target_include_directories(vk_device PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(vk_device PRIVATE cudart)
+    target_compile_definitions(vk_device PRIVATE SWIFTSHADER_ENABLE_CUDA)
+    set_source_files_properties(CudaTraversal.cu PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+endif()

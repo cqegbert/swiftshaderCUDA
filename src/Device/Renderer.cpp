@@ -14,6 +14,10 @@
 
 #include "Renderer.hpp"
 
+#ifdef SWIFTSHADER_ENABLE_CUDA
+#	include "CudaRasterizer.hpp"
+#endif
+
 #include "Clipper.hpp"
 #include "Polygon.hpp"
 #include "Primitive.hpp"
@@ -255,6 +259,7 @@ void Renderer::draw(const vk::GraphicsPipeline *pipeline, const vk::DynamicState
 	unsigned int numPrimitivesPerBatch = MaxBatchSize / ms;
 
 	DrawData *data = draw->data;
+	draw->multiSampleCount = ms;
 	draw->occlusionQuery = occlusionQuery;
 	draw->batchDataPool = &batchDataPool;
 	draw->numPrimitives = count;
@@ -647,6 +652,41 @@ void DrawCall::processPixels(vk::Device *device, const marl::Loan<DrawCall> &dra
 		std::shared_ptr<marl::Finally> finally;
 	};
 	auto data = std::make_shared<Data>(draw, batch, finally);
+
+#ifdef SWIFTSHADER_ENABLE_CUDA
+	// CUDA path: offload triangle traversal to the GPU.
+	// The traversal kernel emits covered 2×2 quads; the CPU then calls the
+	// existing JIT pixel routine for each quad.
+	// Limitation: only the single-sample path is supported here; MSAA draws
+	// fall through to the standard 16-cluster CPU loop below.
+	if(sw::CudaRasterizer::isAvailable() && draw->multiSampleCount == 1)
+	{
+		// Cluster ticket 0 does all CUDA traversal + per-quad pixel shading.
+		// Tickets 1–15 are no-ops; they must still be consumed in order so
+		// the ticket queue advances and the batch can complete normally.
+		batch->clusterTickets[0].onCall([device, data] {
+			auto &draw  = data->draw;
+			auto &batch = data->batch;
+			MARL_SCOPED_EVENT("PIXEL(CUDA) draw %d, batch %d", draw->id, batch->id);
+			sw::CudaRasterizer::processPixels(
+			    &batch->primitives.front(),
+			    batch->numVisible,
+			    draw->pixelRoutine,
+			    draw->data,
+			    device);
+			batch->clusterTickets[0].done();
+		});
+		for(int cluster = 1; cluster < MaxClusterCount; cluster++)
+		{
+			batch->clusterTickets[cluster].onCall([data, cluster] {
+				data->batch->clusterTickets[cluster].done();
+			});
+		}
+		return;
+	}
+#endif
+
+	// Standard 16-cluster CPU path.
 	for(int cluster = 0; cluster < MaxClusterCount; cluster++)
 	{
 		batch->clusterTickets[cluster].onCall([device, data, cluster] {

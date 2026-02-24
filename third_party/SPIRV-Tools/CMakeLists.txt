@@ -237,8 +237,11 @@ if(NOT COMMAND find_host_program)
   endmacro()
 endif()
 
-# Tests require Python3
-find_host_package(Python3 REQUIRED)
+# Python3 is needed for code generation; tests additionally require it
+find_host_package(Python3)
+if(NOT Python3_FOUND AND NOT SPIRV_SKIP_TESTS)
+  message(FATAL_ERROR "Could not find Python3 (required for tests).")
+endif()
 
 # Check type annotations in Perl code. Assumes mypy.
 add_custom_target(spirv-tools-check-python-types

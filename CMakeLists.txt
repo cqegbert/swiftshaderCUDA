@@ -16,6 +16,29 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project(SwiftShader C CXX ASM)
 
+###########################################################
+# Optional CUDA support for GPU-accelerated rasterization
+###########################################################
+# Use find_program instead of check_language so we can inject
+# -allow-unsupported-compiler into CMAKE_CUDA_FLAGS before
+# enable_language runs its ABI test.  CUDA 13.x only officially
+# supports up to VS 2022; the flag bypasses that version check.
+find_program(_cuda_nvcc nvcc
+    HINTS "$ENV{CUDA_PATH}/bin" "$ENV{CUDA_HOME}/bin"
+    DOC "CUDA nvcc compiler")
+if(_cuda_nvcc)
+    set(CMAKE_CUDA_COMPILER "${_cuda_nvcc}" CACHE FILEPATH "CUDA compiler" FORCE)
+    # Suppress MSVC version check so CUDA 13.x builds with VS 2026+
+    set(CMAKE_CUDA_FLAGS "-allow-unsupported-compiler" CACHE STRING "CUDA compiler flags")
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+    message(STATUS "CUDA found (${CMAKE_CUDA_COMPILER}) – GPU traversal enabled")
+else()
+    message(STATUS "CUDA not found – CPU-only rasterization")
+endif()
+unset(_cuda_nvcc CACHE)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CXX_STANDARD_REQUIRED ON)
 # MSVC doesn't define __cplusplus by default

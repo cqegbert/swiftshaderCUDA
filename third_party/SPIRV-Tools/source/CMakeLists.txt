@@ -36,7 +36,7 @@ set(EI_tosa_001000_1 "${GRAMMAR_DIR}/extinst.tosa.001000.1.grammar.json")
 set(CORE_TABLES_BODY_INC_FILE ${spirv-tools_BINARY_DIR}/core_tables_body.inc)
 set(CORE_TABLES_HEADER_INC_FILE ${spirv-tools_BINARY_DIR}/core_tables_header.inc)
 add_custom_command(OUTPUT ${CORE_TABLES_BODY_INC_FILE} ${CORE_TABLES_HEADER_INC_FILE}
-    COMMAND Python3::Interpreter ${GGT_SCRIPT}
+    COMMAND ${Python3_EXECUTABLE} ${GGT_SCRIPT}
       --core-tables-body-output=${CORE_TABLES_BODY_INC_FILE}
       --core-tables-header-output=${CORE_TABLES_HEADER_INC_FILE}
       --spirv-core-grammar=${SPIRV_CORE_GRAMMAR_JSON_FILE}
@@ -75,7 +75,7 @@ macro(spvtools_vimsyntax CONFIG_VERSION CLVERSION)
   set(OPENCL_GRAMMAR_JSON_FILE "${SPIRV_HEADER_INCLUDE_DIR}/spirv/${CONFIG_VERSION}/extinst.opencl.std.100.grammar.json")
   set(VIMSYNTAX_FILE "${spirv-tools_BINARY_DIR}/spvasm.vim")
   add_custom_command(OUTPUT ${VIMSYNTAX_FILE}
-      COMMAND Python3::Interpreter ${VIMSYNTAX_PROCESSING_SCRIPT}
+      COMMAND ${Python3_EXECUTABLE} ${VIMSYNTAX_PROCESSING_SCRIPT}
       --spirv-core-grammar=${GRAMMAR_JSON_FILE}
       --extinst-debuginfo-grammar=${EI_debuginfo}
       --extinst-glsl-grammar=${GLSL_GRAMMAR_JSON_FILE}
@@ -89,7 +89,7 @@ endmacro(spvtools_vimsyntax)
 macro(spvtools_extinst_lang_headers NAME GRAMMAR_FILE)
   set(OUT_H ${spirv-tools_BINARY_DIR}/${NAME}.h)
   add_custom_command(OUTPUT ${OUT_H}
-    COMMAND Python3::Interpreter ${LANG_HEADER_PROCESSING_SCRIPT}
+    COMMAND ${Python3_EXECUTABLE} ${LANG_HEADER_PROCESSING_SCRIPT}
       --extinst-grammar=${GRAMMAR_FILE}
       --extinst-output-path=${OUT_H}
     DEPENDS ${LANG_HEADER_PROCESSING_SCRIPT} ${GRAMMAR_FILE}
@@ -111,7 +111,7 @@ set_property(TARGET spirv-tools-vimsyntax PROPERTY FOLDER "SPIRV-Tools utilities
 set(GENERATOR_INC_FILE ${spirv-tools_BINARY_DIR}/generators.inc)
 set(SPIRV_XML_REGISTRY_FILE ${SPIRV_HEADER_INCLUDE_DIR}/spirv/spir-v.xml)
 add_custom_command(OUTPUT ${GENERATOR_INC_FILE}
-  COMMAND Python3::Interpreter ${XML_REGISTRY_PROCESSING_SCRIPT}
+  COMMAND ${Python3_EXECUTABLE} ${XML_REGISTRY_PROCESSING_SCRIPT}
     --xml=${SPIRV_XML_REGISTRY_FILE}
     --generator-output=${GENERATOR_INC_FILE}
   DEPENDS ${XML_REGISTRY_PROCESSING_SCRIPT} ${SPIRV_XML_REGISTRY_FILE}
@@ -141,7 +141,7 @@ set(SPIRV_TOOLS_BUILD_VERSION_INC_GENERATOR
 set(SPIRV_TOOLS_CHANGES_FILE
   ${spirv-tools_SOURCE_DIR}/CHANGES)
 add_custom_command(OUTPUT ${SPIRV_TOOLS_BUILD_VERSION_INC}
-   COMMAND Python3::Interpreter
+   COMMAND ${Python3_EXECUTABLE}
            ${SPIRV_TOOLS_BUILD_VERSION_INC_GENERATOR}
            ${SPIRV_TOOLS_CHANGES_FILE} ${SPIRV_TOOLS_BUILD_VERSION_INC}
    DEPENDS ${SPIRV_TOOLS_BUILD_VERSION_INC_GENERATOR}

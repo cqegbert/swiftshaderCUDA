@@ -156,6 +156,8 @@ struct DrawCall
 	bool depthClipEnable;
 	bool depthClipNegativeOneToOne;
 
+	int multiSampleCount;  // 1, 2, or 4 – used to gate the CUDA traversal path
+
 	VertexProcessor::RoutineType vertexRoutine;
 	SetupProcessor::RoutineType setupRoutine;
 	PixelProcessor::RoutineType pixelRoutine;
