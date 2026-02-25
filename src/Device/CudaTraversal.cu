@@ -49,7 +49,15 @@ namespace {
 // per block iteration, which is enough for typical triangle heights.
 static constexpr int THREADS_PER_BLOCK = 128;
 
+// Maximum quads a single thread accumulates before flushing to global memory.
+// 512 entries × 8 bytes = 4 KB per thread in local/L1 memory.
+// If a scanline pair produces more quads than this cap the extras fall through
+// to individual atomicAdd calls (correctness preserved, rare in practice).
+static constexpr int kLocalBufCap = 512;
+
 // Kernel: one block per primitive, threads stride through scanline pairs.
+// Opt 4: each thread accumulates quads in a thread-local buffer then does a
+// single batched atomicAdd per scanline pair, reducing global atomics by ~20×.
 __global__ void traverseKernel(
     sw::GPUPrimitive **primPtrs,
     int primCount,
@@ -79,6 +87,10 @@ __global__ void traverseKernel(
 		const int x0 = (min(static_cast<int>(sy.left), static_cast<int>(sy1.left))) & ~1;
 		const int x1 =  max(static_cast<int>(sy.right), static_cast<int>(sy1.right));
 
+		// Thread-local accumulation buffer (lives in L1/local memory).
+		sw::QuadWorkItem localBuf[kLocalBufCap];
+		int localCount = 0;
+
 		for(int x = x0; x < x1; x += 2)
 		{
 			// Compute 4-bit coverage mask for this 2×2 quad.
@@ -92,16 +104,40 @@ __global__ void traverseKernel(
 
 			if(cMask)
 			{
-				const int idx = atomicAdd(count, 1);
-				if(idx < maxItems)
+				if(localCount < kLocalBufCap)
 				{
-					sw::QuadWorkItem item;
-					item.x       = static_cast<int16_t>(x);
-					item.y       = static_cast<int16_t>(y);
-					item.cMask   = static_cast<uint32_t>(cMask);
-					item.primIdx = static_cast<uint32_t>(primIdx);
-					queue[idx]   = item;
+					localBuf[localCount].x       = static_cast<int16_t>(x);
+					localBuf[localCount].y       = static_cast<int16_t>(y);
+					localBuf[localCount].cMask   = static_cast<uint32_t>(cMask);
+					localBuf[localCount].primIdx = static_cast<uint32_t>(primIdx);
+					++localCount;
 				}
+				else
+				{
+					// Buffer full: fall back to individual atomic (rare).
+					const int idx = atomicAdd(count, 1);
+					if(idx < maxItems)
+					{
+						sw::QuadWorkItem item;
+						item.x       = static_cast<int16_t>(x);
+						item.y       = static_cast<int16_t>(y);
+						item.cMask   = static_cast<uint32_t>(cMask);
+						item.primIdx = static_cast<uint32_t>(primIdx);
+						queue[idx]   = item;
+					}
+				}
+			}
+		}
+
+		// Flush the local buffer with a single batched atomicAdd.
+		if(localCount > 0)
+		{
+			const int base = atomicAdd(count, localCount);
+			for(int k = 0; k < localCount; ++k)
+			{
+				const int idx = base + k;
+				if(idx < maxItems)
+					queue[idx] = localBuf[k];
 			}
 		}
 	}

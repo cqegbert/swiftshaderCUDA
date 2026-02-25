@@ -61,16 +61,6 @@ public:
 	    DrawData *data,
 	    vk::Device *device);
 
-private:
-	// Build a synthetic Primitive that covers exactly one 2×2 quad at (x, y)
-	// with the given coverage mask.  All plane equations are copied from src.
-	// The outline is set so the existing Reactor rasteriser produces cMask.
-	static void buildSingleQuadPrimitive(
-	    Primitive &dst,
-	    const Primitive &src,
-	    int x,
-	    int y,
-	    uint8_t cMask);
 };
 
 }  // namespace sw

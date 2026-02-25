@@ -43,10 +43,15 @@
 #  undef  _SW_SAVED_MINOR_VERSION
 #endif
 
+#include "marl/defer.h"
+#include "marl/scheduler.h"
+#include "marl/waitgroup.h"
+
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstring>
 #include <mutex>
-#include <vector>
 
 // ---------------------------------------------------------------------------
 // Macro helpers
@@ -78,22 +83,41 @@ bool g_available = false;
 cudaStream_t g_stream = nullptr;
 
 // Pinned host memory for uploading span data and downloading work items.
-// Reused across frames; grown on demand.
 static constexpr int kMaxWorkItems = CUDA_MAX_WORK_ITEMS;
 static constexpr int kMaxPrims     = sw::MaxBatchSize;
 
+// Number of parallel scanline-pair stripes (= MaxClusterCount = 16).
+static constexpr int kNumStripes = sw::MaxClusterCount;
+
+// Per-quad cost reduction: copy only plane-equation bytes, skip full memcpy.
+// offsetof(Primitive, outline) == 1800 bytes on all supported platforms.
+static constexpr size_t kPrimEquationBytes = offsetof(sw::Primitive, outline);
+
+// Fixed slot size for one primitive's GPU span data.
+// spans[0] is already in sizeof(GPUPrimitive); add OUTLINE_RESOLUTION more
+// slots plus one guard span = OUTLINE_RESOLUTION+1 additional spans.
+static constexpr size_t kPrimSlotSize =
+    sizeof(GPUPrimitive) + (OUTLINE_RESOLUTION + 1) * sizeof(GPUSpan);  // ~32784 bytes
+
 QuadWorkItem *g_pinnedWorkQueue = nullptr;  // host-side, pinned
 int          *g_pinnedCount     = nullptr;  // host-side atomic count, pinned
+
+// Second work-queue buffer for sorted output (pinned).
+QuadWorkItem *g_sortedQueue = nullptr;
 
 // Device-side work queue and atomic counter.
 QuadWorkItem *g_devWorkQueue = nullptr;
 int          *g_devCount     = nullptr;
 
 // Device-side per-primitive span buffers and pointer array.
-// We keep one large slab and suballocate per batch.
-GPUPrimitive *g_devPrimSlabs[kMaxPrims] = {};  // per-primitive device buffers
+// All device slabs live inside g_devPrimPool; pointers are set once at init.
+GPUPrimitive *g_devPrimSlabs[kMaxPrims] = {};  // fixed offsets into pool
 GPUPrimitive **g_devPrimPtrs            = nullptr;  // device array of pointers
 GPUPrimitive **g_pinnedPrimPtrs         = nullptr;  // pinned host array of pointers
+
+// Pre-allocated pools (Opt 2): no per-frame cudaMalloc/cudaFree.
+GPUPrimitive *g_devPrimPool    = nullptr;  // device, kMaxPrims * kPrimSlotSize
+char         *g_pinnedPrimPool = nullptr;  // pinned host, same size
 
 void initOnce()
 {
@@ -109,15 +133,25 @@ void initOnce()
 
 	CUDA_CHECK(cudaStreamCreate(&g_stream));
 
-	// Work queue
+	// Work queues (primary + sorted)
 	CUDA_CHECK(cudaMallocHost(&g_pinnedWorkQueue, sizeof(QuadWorkItem) * kMaxWorkItems));
 	CUDA_CHECK(cudaMallocHost(&g_pinnedCount,     sizeof(int)));
+	CUDA_CHECK(cudaMallocHost(&g_sortedQueue,     sizeof(QuadWorkItem) * kMaxWorkItems));
 	CUDA_CHECK(cudaMalloc(&g_devWorkQueue,        sizeof(QuadWorkItem) * kMaxWorkItems));
 	CUDA_CHECK(cudaMalloc(&g_devCount,            sizeof(int)));
 
 	// Primitive pointer arrays
 	CUDA_CHECK(cudaMallocHost(&g_pinnedPrimPtrs, sizeof(GPUPrimitive *) * kMaxPrims));
 	CUDA_CHECK(cudaMalloc(&g_devPrimPtrs,        sizeof(GPUPrimitive *) * kMaxPrims));
+
+	// Pre-allocate fixed-size span pools (Opt 2): one allocation each, sliced.
+	CUDA_CHECK(cudaMalloc    (&g_devPrimPool,    (size_t)kMaxPrims * kPrimSlotSize));
+	CUDA_CHECK(cudaMallocHost(&g_pinnedPrimPool, (size_t)kMaxPrims * kPrimSlotSize));
+
+	// Point each slab pointer to its fixed slot — never changes after init.
+	for(int i = 0; i < kMaxPrims; ++i)
+		g_devPrimSlabs[i] = reinterpret_cast<GPUPrimitive *>(
+		    reinterpret_cast<char *>(g_devPrimPool) + i * kPrimSlotSize);
 }
 
 }  // namespace
@@ -146,67 +180,18 @@ void CudaRasterizer::shutdown()
 
 	cudaFreeHost(g_pinnedWorkQueue);
 	cudaFreeHost(g_pinnedCount);
+	cudaFreeHost(g_sortedQueue);
 	cudaFree(g_devWorkQueue);
 	cudaFree(g_devCount);
 
 	cudaFreeHost(g_pinnedPrimPtrs);
 	cudaFree(g_devPrimPtrs);
 
-	for(int i = 0; i < kMaxPrims; ++i)
-	{
-		if(g_devPrimSlabs[i])
-		{
-			cudaFree(g_devPrimSlabs[i]);
-			g_devPrimSlabs[i] = nullptr;
-		}
-	}
+	// Pool frees — individual g_devPrimSlabs[i] are offsets into the pool.
+	cudaFree    (g_devPrimPool);
+	cudaFreeHost(g_pinnedPrimPool);
 
 	g_available = false;
-}
-
-// ---------------------------------------------------------------------------
-// buildSingleQuadPrimitive
-//
-// Construct a Primitive that makes the existing Reactor rasteriser visit
-// exactly one 2×2 quad at (x, y) with the coverage described by cMask.
-//
-// Coverage mapping (from QuadRasterizer::rasterize()):
-//   bit 0 → pixel (x,   y):   left_y  ≤ x   < right_y
-//   bit 1 → pixel (x+1, y):   left_y  ≤ x+1 < right_y
-//   bit 2 → pixel (x,   y+1): left_y1 ≤ x   < right_y1
-//   bit 3 → pixel (x+1, y+1): left_y1 ≤ x+1 < right_y1
-//
-// So for row y with bits {b0, b1}:
-//   left_y  = b0 ? x : (b1 ? x+1 : x+2)
-//   right_y = b1 ? x+2 : (b0 ? x+1 : x)
-// ---------------------------------------------------------------------------
-
-void CudaRasterizer::buildSingleQuadPrimitive(
-    Primitive &dst,
-    const Primitive &src,
-    int x, int y,
-    uint8_t cMask)
-{
-	// Copy all plane equations, stencil masks, reference points, etc.
-	std::memcpy(&dst, &src, sizeof(Primitive));
-
-	// Restrict vertical range to this single scanline pair.
-	dst.yMin = y;
-	dst.yMax = y + 2;
-
-	// Zero the entire outline then write only the two scanlines we need.
-	// The rasteriser reads outline[yMin] and outline[yMin+1].
-	std::memset(dst.outline, 0, sizeof(dst.outline));
-
-	auto encodeRow = [x](uint8_t b0, uint8_t b1) -> Primitive::Span {
-		Primitive::Span s;
-		s.left  = static_cast<unsigned short>(b0 ? x : (b1 ? x + 1 : x + 2));
-		s.right = static_cast<unsigned short>(b1 ? x + 2 : (b0 ? x + 1 : x));
-		return s;
-	};
-
-	dst.outline[y]     = encodeRow(cMask & 1, cMask & 2);
-	dst.outline[y + 1] = encodeRow(cMask & 4, cMask & 8);
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +208,7 @@ void CudaRasterizer::processPixels(
 	if(count <= 0) return;
 
 	// ------------------------------------------------------------------
-	// 1. Upload primitive outline spans to GPU
+	// 1. Upload primitive outline spans to GPU (Opt 2: no per-prim alloc)
 	// ------------------------------------------------------------------
 	for(int i = 0; i < count; ++i)
 	{
@@ -235,28 +220,12 @@ void CudaRasterizer::processPixels(
 			continue;
 		}
 
-		// Size of GPUPrimitive with 'spanCount' entries, plus one overflow guard span.
-		// spans[0] is already counted in sizeof(GPUPrimitive) (flexible array with [1]).
-		// The +1 guard span is read by the kernel when (yMax - yMin) is odd: the last
-		// scanline pair has spanIdx1 = spanCount, which would be one past the end without
-		// it.  Initialising it to {0, 0} (empty span) prevents out-of-bounds garbage from
-		// producing full-width work items that appear as horizontal streaks in the output.
-		const size_t slab = sizeof(GPUPrimitive) + sizeof(GPUSpan) * spanCount;  // spanCount+1 slots total
+		// Size of actual data to transfer (spanCount entries + one guard span).
+		const size_t slab = sizeof(GPUPrimitive) + sizeof(GPUSpan) * spanCount;
 
-		// Reallocate device slab if needed (grow only).
-		if(g_devPrimSlabs[i])
-		{
-			// Re-use; we always free+reallocate on size changes for simplicity.
-			// In a production path you'd track allocated sizes.
-			cudaFree(g_devPrimSlabs[i]);
-			g_devPrimSlabs[i] = nullptr;
-		}
-		CUDA_CHECK(cudaMalloc(&g_devPrimSlabs[i], slab));
-
-		// Build a temporary host-side GPUPrimitive in a small stack buffer
-		// (spanCount can be large; use heap for safety).
-		std::vector<char> hostBuf(slab);
-		GPUPrimitive *hp = reinterpret_cast<GPUPrimitive *>(hostBuf.data());
+		// Use pre-allocated pinned slot for staging — no heap alloc (Opt 2).
+		GPUPrimitive *hp = reinterpret_cast<GPUPrimitive *>(
+		    g_pinnedPrimPool + (size_t)i * kPrimSlotSize);
 		hp->yMin = p.yMin;
 		hp->yMax = p.yMax;
 		for(int s = 0; s < spanCount; ++s)
@@ -264,9 +233,10 @@ void CudaRasterizer::processPixels(
 			hp->spans[s].left  = p.outline[p.yMin + s].left;
 			hp->spans[s].right = p.outline[p.yMin + s].right;
 		}
-		// Overflow guard: kernel may read spans[spanCount] when spanCount is odd.
+		// Guard span: kernel may read spans[spanCount] when spanCount is odd.
 		hp->spans[spanCount] = { 0, 0 };
 
+		// Upload only the actual slab bytes (not the full fixed slot).
 		CUDA_CHECK(cudaMemcpyAsync(g_devPrimSlabs[i], hp, slab,
 		                           cudaMemcpyHostToDevice, g_stream));
 		g_pinnedPrimPtrs[i] = g_devPrimSlabs[i];
@@ -308,20 +278,99 @@ void CudaRasterizer::processPixels(
 	CUDA_CHECK(cudaStreamSynchronize(g_stream));  // wait for data
 
 	// ------------------------------------------------------------------
-	// 5. Process each covered quad using the existing pixel routine
+	// 5. Sort quads into 16 scanline-pair stripes, then process in parallel
+	//    (Opt 1: partial memcpy only; Opt 3: 16-way marl parallelism)
+	//
+	// Thread-safety: worker t handles quads where (item.y/2) % 16 == t.
+	// Each 2×2 quad occupies a unique scanline pair, so workers never
+	// write to the same pixel row — no locks needed.
 	// ------------------------------------------------------------------
-	// We call pixelRoutine with a single-quad Primitive (count=1, cluster=0,
-	// clusterCount=1).  The routine internally calls rasterize() which finds
-	// exactly the one quad we encoded.
-	Primitive singleQuad;
 
+	// Pass 1: count quads per stripe (O(N) counting sort).
+	int stripeCounts[kNumStripes] = {};
+	for(int q = 0; q < clampedQuads; ++q)
+		stripeCounts[(g_pinnedWorkQueue[q].y / 2) % kNumStripes]++;
+
+	// Exclusive prefix sum → stripe start offsets.
+	int stripeStarts[kNumStripes + 1];
+	stripeStarts[0] = 0;
+	for(int i = 0; i < kNumStripes; ++i)
+		stripeStarts[i + 1] = stripeStarts[i] + stripeCounts[i];
+
+	// Pass 2: scatter into sorted buffer.
+	int pos[kNumStripes];
+	std::copy(stripeStarts, stripeStarts + kNumStripes, pos);
 	for(int q = 0; q < clampedQuads; ++q)
 	{
-		const QuadWorkItem &item = g_pinnedWorkQueue[q];
-		buildSingleQuadPrimitive(singleQuad, primitives[item.primIdx],
-		                         item.x, item.y, item.cMask);
-		pixelRoutine(device, &singleQuad, 1, 0, 1, data);
+		int s = (g_pinnedWorkQueue[q].y / 2) % kNumStripes;
+		g_sortedQueue[pos[s]++] = g_pinnedWorkQueue[q];
 	}
+
+	// Sort each stripe by (y, primIdx) to preserve draw order within the stripe.
+	for(int s = 0; s < kNumStripes; ++s)
+		std::sort(g_sortedQueue + stripeStarts[s],
+		          g_sortedQueue + stripeStarts[s + 1],
+		          [](const QuadWorkItem &a, const QuadWorkItem &b) {
+			          return a.y != b.y ? a.y < b.y : a.primIdx < b.primIdx;
+		          });
+
+	// Dispatch one marl task per stripe.
+	marl::WaitGroup wg(kNumStripes);
+	for(int s = 0; s < kNumStripes; ++s)
+	{
+		const int qStart = stripeStarts[s];
+		const int qEnd   = stripeStarts[s + 1];
+
+		marl::schedule([=, &wg]() {
+			defer(wg.done());
+
+			// Each worker has its own stack-local Primitive — no sharing.
+			Primitive local;
+			int lastPrimIdx = -1;
+
+			for(int q = qStart; q < qEnd; ++q)
+			{
+				const QuadWorkItem &item = g_sortedQueue[q];
+				const int x             = item.x;
+				const int y             = item.y;
+				const uint8_t cMask     = static_cast<uint8_t>(item.cMask);
+
+				// Opt 1: copy only plane-equation bytes when primitive changes.
+				if(static_cast<int>(item.primIdx) != lastPrimIdx)
+				{
+					std::memcpy(&local, &primitives[item.primIdx], kPrimEquationBytes);
+					lastPrimIdx = static_cast<int>(item.primIdx);
+				}
+
+				local.yMin = y;
+				local.yMax = y + 2;
+
+				// QuadRasterizer::generate() aligns yMin &= -2, rounding any ODD y
+				// down to y-1.  That produces TWO rasterizer loop iterations:
+				//   iter 0: reads outline[y-1] and outline[y]
+				//   iter 1: reads outline[y+1] and outline[y+2]
+				// The entries at y-1 and y+2 are outside our coverage range and may
+				// contain stale values from earlier quads processed in this worker's
+				// stripe.  Zero them so both extra rows produce empty spans and the
+				// rasterizer writes no pixels there.
+				if(y & 1)
+				{
+					local.outline[y - 1] = { 0, 0 };
+					local.outline[y + 2] = { 0, 0 };
+				}
+
+				// Row y (bits 0, 1)
+				local.outline[y].left   = static_cast<uint16_t>((cMask & 1) ? x     : ((cMask & 2) ? x + 1 : x + 2));
+				local.outline[y].right  = static_cast<uint16_t>((cMask & 2) ? x + 2 : ((cMask & 1) ? x + 1 : x    ));
+				// Row y+1 (bits 2, 3)
+				local.outline[y + 1].left  = static_cast<uint16_t>((cMask & 4) ? x     : ((cMask & 8) ? x + 1 : x + 2));
+				local.outline[y + 1].right = static_cast<uint16_t>((cMask & 8) ? x + 2 : ((cMask & 4) ? x + 1 : x    ));
+
+				pixelRoutine(device, &local, 1, 0, 1, data);
+			}
+		});
+	}
+	wg.wait();
 }
 
 }  // namespace sw
