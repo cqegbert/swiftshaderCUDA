@@ -65,11 +65,16 @@ static constexpr int kLocalBufCap = 512;
 // After all threads in the warp have exited the y-loop, they converge at this
 // function.  Instead of 32 separate atomicAdd calls (one per lane), we:
 //
-//   1. Compute an intra-warp exclusive prefix sum of each lane's localCount
-//      using __shfl_up_sync.  This gives each lane its unique write offset
-//      within the warp's contiguous slice of the global queue.
+//   1. Compute an intra-warp inclusive prefix sum of localCount by shuffling
+//      the RUNNING SUM 'val' (not the original localCount) via __shfl_up_sync.
+//      The exclusive offset for each lane is val - localCount.
 //   2. Lane 0 issues a single atomicAdd(count, warpTotal) to claim the slice.
 //   3. Each lane writes its items to queue[warpBase + myOffset + k].
+//
+// IMPORTANT: shuffling the original localCount (not the running sum) would
+// give wrong results for non-power-of-2 inter-lane distances — e.g. lane 3
+// can't see lane 0 directly.  Shuffling 'val' propagates partial sums so
+// every lane correctly accumulates all predecessors.
 //
 // Result: THREADS_PER_BLOCK/32 = 4 atomicAdds per block (down from 128).
 // This is the common path for small/medium triangles that never overflow.
@@ -89,16 +94,20 @@ __device__ __forceinline__ void flushWarp(
 	static constexpr unsigned FULL_MASK = 0xFFFFFFFFu;
 	const int laneId = static_cast<int>(threadIdx.x) & 31;
 
-	// Exclusive prefix sum: myOffset = Σ localCount[l] for l in [0, laneId).
-	int myOffset = 0;
+	// Inclusive prefix sum: evolve 'val' from per-lane count to running total.
+	// Each iteration propagates partial sums across twice the previous distance,
+	// so after log2(32)=5 steps val[i] = sum(localCount[0..i]).
+	int val = localCount;
 	for(int delta = 1; delta < 32; delta <<= 1)
 	{
-		const int n = __shfl_up_sync(FULL_MASK, localCount, static_cast<unsigned>(delta));
-		if(laneId >= delta) myOffset += n;
+		const int n = __shfl_up_sync(FULL_MASK, val, static_cast<unsigned>(delta));
+		if(laneId >= delta) val += n;
 	}
 
-	// Warp total = lane31's (exclusive prefix) + lane31's own count.
-	const int warpTotal = __shfl_sync(FULL_MASK, myOffset + localCount, 31);
+	// Exclusive prefix sum = inclusive sum − own count.
+	const int myOffset  = val - localCount;
+	// Warp total = val[31] = inclusive prefix sum of all 32 lanes.
+	const int warpTotal = __shfl_sync(FULL_MASK, val, 31);
 	if(warpTotal == 0) return;  // Whole warp has nothing to flush (no divergence).
 
 	// Lane 0 claims a contiguous slot for the entire warp.
