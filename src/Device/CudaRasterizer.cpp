@@ -306,12 +306,17 @@ void CudaRasterizer::processPixels(
 		g_sortedQueue[pos[s]++] = g_pinnedWorkQueue[q];
 	}
 
-	// Sort each stripe by (y, primIdx) to preserve draw order within the stripe.
+	// Sort each stripe by (primIdx, y).
+	// Sorting primIdx-first maximises cache hits in the worker loop: the
+	// lastPrimIdx optimisation copies kPrimEquationBytes (1800 B) only when
+	// the primitive changes, so grouping all quads from the same primitive
+	// together reduces copies from O(N) to O(distinct_primitives_per_stripe).
+	// Within a primitive, sorting by y preserves raster-order for blending.
 	for(int s = 0; s < kNumStripes; ++s)
 		std::sort(g_sortedQueue + stripeStarts[s],
 		          g_sortedQueue + stripeStarts[s + 1],
 		          [](const QuadWorkItem &a, const QuadWorkItem &b) {
-			          return a.y != b.y ? a.y < b.y : a.primIdx < b.primIdx;
+			          return a.primIdx != b.primIdx ? a.primIdx < b.primIdx : a.y < b.y;
 		          });
 
 	// Dispatch one marl task per stripe.

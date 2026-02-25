@@ -49,15 +49,81 @@ namespace {
 // per block iteration, which is enough for typical triangle heights.
 static constexpr int THREADS_PER_BLOCK = 128;
 
-// Maximum quads a single thread accumulates before flushing to global memory.
-// 512 entries × 8 bytes = 4 KB per thread in local/L1 memory.
-// If a scanline pair produces more quads than this cap the extras fall through
-// to individual atomicAdd calls (correctness preserved, rare in practice).
+// Maximum quads a single thread accumulates before a per-thread overflow flush.
+// 512 entries × 8 bytes = 4 KB per thread in CUDA local memory (DRAM-backed;
+// L2 may cache recently written entries but this does not reside in registers).
+// The buffer lives OUTSIDE the scanline-pair loop so small/medium triangles
+// pay only one warp-level atomicAdd per warp total rather than one per thread.
+// When the buffer fills mid-loop an overflow flush is issued (one per-thread
+// atomicAdd per kLocalBufCap quads), keeping atomicAdd count bounded.
 static constexpr int kLocalBufCap = 512;
 
+// ---------------------------------------------------------------------------
+// Opt 5: warp-level final flush.
+// ---------------------------------------------------------------------------
+//
+// After all threads in the warp have exited the y-loop, they converge at this
+// function.  Instead of 32 separate atomicAdd calls (one per lane), we:
+//
+//   1. Compute an intra-warp exclusive prefix sum of each lane's localCount
+//      using __shfl_up_sync.  This gives each lane its unique write offset
+//      within the warp's contiguous slice of the global queue.
+//   2. Lane 0 issues a single atomicAdd(count, warpTotal) to claim the slice.
+//   3. Each lane writes its items to queue[warpBase + myOffset + k].
+//
+// Result: THREADS_PER_BLOCK/32 = 4 atomicAdds per block (down from 128).
+// This is the common path for small/medium triangles that never overflow.
+// Large triangles also benefit on their final (partial) buffer.
+//
+// Correctness requirement: all 32 lanes must be at the same program counter
+// when this function is called (no active divergence within the warp).
+// This is guaranteed because the function is called after the y-loop, where
+// every lane has exited and the warp has fully re-converged.
+__device__ __forceinline__ void flushWarp(
+    const sw::QuadWorkItem *localBuf,
+    int                     localCount,
+    sw::QuadWorkItem       *queue,
+    int                    *count,
+    int                     maxItems)
+{
+	static constexpr unsigned FULL_MASK = 0xFFFFFFFFu;
+	const int laneId = static_cast<int>(threadIdx.x) & 31;
+
+	// Exclusive prefix sum: myOffset = Σ localCount[l] for l in [0, laneId).
+	int myOffset = 0;
+	for(int delta = 1; delta < 32; delta <<= 1)
+	{
+		const int n = __shfl_up_sync(FULL_MASK, localCount, static_cast<unsigned>(delta));
+		if(laneId >= delta) myOffset += n;
+	}
+
+	// Warp total = lane31's (exclusive prefix) + lane31's own count.
+	const int warpTotal = __shfl_sync(FULL_MASK, myOffset + localCount, 31);
+	if(warpTotal == 0) return;  // Whole warp has nothing to flush (no divergence).
+
+	// Lane 0 claims a contiguous slot for the entire warp.
+	int warpBase = 0;
+	if(laneId == 0)
+		warpBase = atomicAdd(count, warpTotal);
+
+	// Broadcast the claimed base to all lanes.
+	warpBase = __shfl_sync(FULL_MASK, warpBase, 0);
+
+	// Each lane writes its items at its exclusive-prefix-sum offset.
+	const int writeBase = warpBase + myOffset;
+	for(int k = 0; k < localCount; ++k)
+	{
+		const int idx = writeBase + k;
+		if(idx < maxItems) queue[idx] = localBuf[k];
+	}
+}
+
 // Kernel: one block per primitive, threads stride through scanline pairs.
-// Opt 4: each thread accumulates quads in a thread-local buffer then does a
-// single batched atomicAdd per scanline pair, reducing global atomics by ~20×.
+// Opt 4 (enhanced): thread-local buffer lives outside the y-loop so quads
+// from all scanline pairs accumulate together, minimising total atomicAdds.
+// Opt 5: final flush uses warp-level aggregation (4 atomicAdds for 128
+// threads) instead of per-thread atomicAdds (128).  Overflow flushes that
+// occur mid-loop when the buffer is full remain per-thread (rare in practice).
 __global__ void traverseKernel(
     sw::GPUPrimitive **primPtrs,
     int primCount,
@@ -73,6 +139,11 @@ __global__ void traverseKernel(
 	const int yMin = p->yMin;
 	const int yMax = p->yMax;
 
+	// Thread-local accumulation buffer — outside the y-loop so it persists
+	// across scanline pairs, amortising atomicAdd cost over all quads.
+	sw::QuadWorkItem localBuf[kLocalBufCap];
+	int localCount = 0;
+
 	// Each thread handles one scanline pair (y, y+1).
 	// Threads stride by blockDim.x * 2 through the primitive's height.
 	for(int y = yMin + static_cast<int>(threadIdx.x) * 2; y < yMax; y += THREADS_PER_BLOCK * 2)
@@ -80,67 +151,60 @@ __global__ void traverseKernel(
 		const int spanIdx0 = y - yMin;
 		const int spanIdx1 = spanIdx0 + 1;
 
-		const sw::GPUSpan sy  = p->spans[spanIdx0];
-		const sw::GPUSpan sy1 = p->spans[spanIdx1];
+		// Load both spans as 32-bit words to avoid repeated uint16_t casts.
+		// GPUSpan layout: { uint16_t left; uint16_t right } → little-endian:
+		//   bits [0..15]  = left,  bits [16..31] = right
+		const uint32_t raw0 = *reinterpret_cast<const uint32_t *>(&p->spans[spanIdx0]);
+		const uint32_t raw1 = *reinterpret_cast<const uint32_t *>(&p->spans[spanIdx1]);
+		const int l0 = (int)(raw0 & 0xFFFFu);
+		const int r0 = (int)(raw0 >> 16);
+		const int l1 = (int)(raw1 & 0xFFFFu);
+		const int r1 = (int)(raw1 >> 16);
 
 		// Union of both rows' spans (aligned to even x for 2×2 quads).
-		const int x0 = (min(static_cast<int>(sy.left), static_cast<int>(sy1.left))) & ~1;
-		const int x1 =  max(static_cast<int>(sy.right), static_cast<int>(sy1.right));
-
-		// Thread-local accumulation buffer (lives in L1/local memory).
-		sw::QuadWorkItem localBuf[kLocalBufCap];
-		int localCount = 0;
+		const int x0 = min(l0, l1) & ~1;
+		const int x1 = max(r0, r1);
 
 		for(int x = x0; x < x1; x += 2)
 		{
-			// Compute 4-bit coverage mask for this 2×2 quad.
+			// Compute 4-bit coverage mask for this 2×2 quad — branchless.
 			// bit 0: pixel (x,   y)   bit 1: pixel (x+1, y)
 			// bit 2: pixel (x,   y+1) bit 3: pixel (x+1, y+1)
-			uint8_t cMask = 0;
-			if(x     >= sy.left  && x     < sy.right)  cMask |= 1;
-			if(x + 1 >= sy.left  && x + 1 < sy.right)  cMask |= 2;
-			if(x     >= sy1.left && x     < sy1.right)  cMask |= 4;
-			if(x + 1 >= sy1.left && x + 1 < sy1.right)  cMask |= 8;
+			// Bitwise & instead of && avoids branch divergence across the warp.
+			const uint32_t cMask =
+			    ((uint32_t)((x     >= l0) & (x     < r0))      ) |
+			    ((uint32_t)((x + 1 >= l0) & (x + 1 < r0)) << 1 ) |
+			    ((uint32_t)((x     >= l1) & (x     < r1)) << 2 ) |
+			    ((uint32_t)((x + 1 >= l1) & (x + 1 < r1)) << 3 );
 
 			if(cMask)
 			{
-				if(localCount < kLocalBufCap)
+				if(localCount == kLocalBufCap)
 				{
-					localBuf[localCount].x       = static_cast<int16_t>(x);
-					localBuf[localCount].y       = static_cast<int16_t>(y);
-					localBuf[localCount].cMask   = static_cast<uint32_t>(cMask);
-					localBuf[localCount].primIdx = static_cast<uint32_t>(primIdx);
-					++localCount;
-				}
-				else
-				{
-					// Buffer full: fall back to individual atomic (rare).
-					const int idx = atomicAdd(count, 1);
-					if(idx < maxItems)
+					// Buffer full: overflow flush with one per-thread atomicAdd.
+					// Rare: only occurs when one thread processes > kLocalBufCap quads
+					// across all its scanline pairs (very wide or very tall triangles).
+					const int base = atomicAdd(count, localCount);
+					for(int k = 0; k < localCount; ++k)
 					{
-						sw::QuadWorkItem item;
-						item.x       = static_cast<int16_t>(x);
-						item.y       = static_cast<int16_t>(y);
-						item.cMask   = static_cast<uint32_t>(cMask);
-						item.primIdx = static_cast<uint32_t>(primIdx);
-						queue[idx]   = item;
+						const int idx = base + k;
+						if(idx < maxItems) queue[idx] = localBuf[k];
 					}
+					localCount = 0;
 				}
-			}
-		}
-
-		// Flush the local buffer with a single batched atomicAdd.
-		if(localCount > 0)
-		{
-			const int base = atomicAdd(count, localCount);
-			for(int k = 0; k < localCount; ++k)
-			{
-				const int idx = base + k;
-				if(idx < maxItems)
-					queue[idx] = localBuf[k];
+				localBuf[localCount].x       = static_cast<int16_t>(x);
+				localBuf[localCount].y       = static_cast<int16_t>(y);
+				localBuf[localCount].cMask   = cMask;
+				localBuf[localCount].primIdx = static_cast<uint32_t>(primIdx);
+				++localCount;
 			}
 		}
 	}
+
+	// Final flush: warp-level aggregation — THREADS_PER_BLOCK/32 = 4 atomicAdds
+	// for a 128-thread block (vs 128 with per-thread atomicAdd).
+	// All warp members have exited the y-loop and are at the same PC here.
+	flushWarp(localBuf, localCount, queue, count, maxItems);
 }
 
 }  // namespace
