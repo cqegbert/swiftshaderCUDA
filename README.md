@@ -2,7 +2,9 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-A fork of [SwiftShader](https://swiftshader.googlesource.com/SwiftShader) that leverages CUDA for graphics work. The Vulkan ICD API is unchanged — it is a drop-in replacement for the standard SwiftShader DLL.
+A fork of [SwiftShader](https://swiftshader.googlesource.com/SwiftShader) that leverages CUDA for accelerating graphics work via a GPU. The motivation behind this is to enable GPUs which do not support Vulkan natively, such as the NVIDIA A100, to perform GPU accelerated graphics work.  I expect this to be relevant for robotics training scenarios in particular, where a cluster of GPUS that are being used for ML training could additionally run graphics simulations as part of their training.
+
+The Vulkan ICD API is unchanged — it is a drop-in replacement for the standard SwiftShader DLL.
 
 
 ## Requirements
