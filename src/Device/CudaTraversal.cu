@@ -133,11 +133,14 @@ __device__ __forceinline__ void flushWarp(
 // Opt 5: final flush uses warp-level aggregation (4 atomicAdds for 128
 // threads) instead of per-thread atomicAdds (128).  Overflow flushes that
 // occur mid-loop when the buffer is full remain per-thread (rare in practice).
+// Opt 11: __restrict__ informs the compiler that none of the pointer args
+// alias each other, enabling better instruction scheduling and memory-access
+// optimisation (e.g. fewer redundant reloads of *count between writes).
 __global__ void traverseKernel(
-    sw::GPUPrimitive **primPtrs,
+    sw::GPUPrimitive * __restrict__ * __restrict__ primPtrs,
     int primCount,
-    sw::QuadWorkItem *queue,
-    int *count,
+    sw::QuadWorkItem * __restrict__ queue,
+    int * __restrict__ count,
     int maxItems)
 {
 	const int primIdx = blockIdx.x;

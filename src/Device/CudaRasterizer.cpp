@@ -306,30 +306,36 @@ void CudaRasterizer::processPixels(
 		g_sortedQueue[pos[s]++] = g_pinnedWorkQueue[q];
 	}
 
-	// Sort each stripe by (primIdx, y, x).
-	// primIdx-first: maximises cache hits (lastPrimIdx copies kPrimEquationBytes
-	//   only when the primitive changes).
-	// y-second: preserves raster order for blending within a primitive.
-	// x-third: makes consecutive full-coverage quads at the same (primIdx, y)
-	//   adjacent in the list, enabling Opt 6 run-merging below.
+	// Opt 9: move the per-stripe sort inside the marl task so all 16 sorts run
+	// in parallel on separate CPU cores rather than sequentially on the caller.
+	// Sort key (primIdx, y, x): amortises plane-eq memcpy (primIdx-first),
+	// preserves raster order for blending (y-second), and groups full-coverage
+	// quads for Opt 6 run-merging (x-third).
+	//
+	// Opt 10: size WaitGroup to non-empty stripes only and skip empty stripes
+	// entirely — avoids marl::schedule overhead for zero-quad stripes, which is
+	// common for sparse or small-primitive scenes.
+	int activeStripes = 0;
 	for(int s = 0; s < kNumStripes; ++s)
-		std::sort(g_sortedQueue + stripeStarts[s],
-		          g_sortedQueue + stripeStarts[s + 1],
-		          [](const QuadWorkItem &a, const QuadWorkItem &b) {
-			          if(a.primIdx != b.primIdx) return a.primIdx < b.primIdx;
-			          if(a.y != b.y) return a.y < b.y;
-			          return a.x < b.x;
-		          });
+		if(stripeStarts[s] < stripeStarts[s + 1]) ++activeStripes;
 
-	// Dispatch one marl task per stripe.
-	marl::WaitGroup wg(kNumStripes);
+	marl::WaitGroup wg(activeStripes);
 	for(int s = 0; s < kNumStripes; ++s)
 	{
 		const int qStart = stripeStarts[s];
 		const int qEnd   = stripeStarts[s + 1];
+		if(qStart == qEnd) continue;  // Opt 10: empty stripe, skip
 
 		marl::schedule([=, &wg]() {
 			defer(wg.done());
+
+			// Opt 9: sort this stripe in parallel with the other stripe tasks.
+			std::sort(g_sortedQueue + qStart, g_sortedQueue + qEnd,
+			          [](const QuadWorkItem &a, const QuadWorkItem &b) {
+				          if(a.primIdx != b.primIdx) return a.primIdx < b.primIdx;
+				          if(a.y != b.y) return a.y < b.y;
+				          return a.x < b.x;
+			          });
 
 			// Each worker has its own stack-local Primitive — no sharing.
 			Primitive local;
