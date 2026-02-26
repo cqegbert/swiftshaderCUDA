@@ -163,8 +163,11 @@ __global__ void traverseKernel(
 		// Load both spans as 32-bit words to avoid repeated uint16_t casts.
 		// GPUSpan layout: { uint16_t left; uint16_t right } → little-endian:
 		//   bits [0..15]  = left,  bits [16..31] = right
-		const uint32_t raw0 = *reinterpret_cast<const uint32_t *>(&p->spans[spanIdx0]);
-		const uint32_t raw1 = *reinterpret_cast<const uint32_t *>(&p->spans[spanIdx1]);
+		// Opt 8: __ldg() routes reads through the read-only (texture) cache,
+		// keeping L1 available for write-back data and improving throughput when
+		// span arrays are shared across multiple warp iterations.
+		const uint32_t raw0 = __ldg(reinterpret_cast<const uint32_t *>(&p->spans[spanIdx0]));
+		const uint32_t raw1 = __ldg(reinterpret_cast<const uint32_t *>(&p->spans[spanIdx1]));
 		const int l0 = (int)(raw0 & 0xFFFFu);
 		const int r0 = (int)(raw0 >> 16);
 		const int l1 = (int)(raw1 & 0xFFFFu);

@@ -306,17 +306,19 @@ void CudaRasterizer::processPixels(
 		g_sortedQueue[pos[s]++] = g_pinnedWorkQueue[q];
 	}
 
-	// Sort each stripe by (primIdx, y).
-	// Sorting primIdx-first maximises cache hits in the worker loop: the
-	// lastPrimIdx optimisation copies kPrimEquationBytes (1800 B) only when
-	// the primitive changes, so grouping all quads from the same primitive
-	// together reduces copies from O(N) to O(distinct_primitives_per_stripe).
-	// Within a primitive, sorting by y preserves raster-order for blending.
+	// Sort each stripe by (primIdx, y, x).
+	// primIdx-first: maximises cache hits (lastPrimIdx copies kPrimEquationBytes
+	//   only when the primitive changes).
+	// y-second: preserves raster order for blending within a primitive.
+	// x-third: makes consecutive full-coverage quads at the same (primIdx, y)
+	//   adjacent in the list, enabling Opt 6 run-merging below.
 	for(int s = 0; s < kNumStripes; ++s)
 		std::sort(g_sortedQueue + stripeStarts[s],
 		          g_sortedQueue + stripeStarts[s + 1],
 		          [](const QuadWorkItem &a, const QuadWorkItem &b) {
-			          return a.primIdx != b.primIdx ? a.primIdx < b.primIdx : a.y < b.y;
+			          if(a.primIdx != b.primIdx) return a.primIdx < b.primIdx;
+			          if(a.y != b.y) return a.y < b.y;
+			          return a.x < b.x;
 		          });
 
 	// Dispatch one marl task per stripe.
@@ -338,7 +340,7 @@ void CudaRasterizer::processPixels(
 				const QuadWorkItem &item = g_sortedQueue[q];
 				const int x             = item.x;
 				const int y             = item.y;
-				const uint8_t cMask     = static_cast<uint8_t>(item.cMask);
+				const uint32_t cMask    = item.cMask;
 
 				// Opt 1: copy only plane-equation bytes when primitive changes.
 				if(static_cast<int>(item.primIdx) != lastPrimIdx)
@@ -350,26 +352,57 @@ void CudaRasterizer::processPixels(
 				local.yMin = y;
 				local.yMax = y + 2;
 
-				// QuadRasterizer::generate() aligns yMin &= -2, rounding any ODD y
-				// down to y-1.  That produces TWO rasterizer loop iterations:
-				//   iter 0: reads outline[y-1] and outline[y]
-				//   iter 1: reads outline[y+1] and outline[y+2]
-				// The entries at y-1 and y+2 are outside our coverage range and may
-				// contain stale values from earlier quads processed in this worker's
-				// stripe.  Zero them so both extra rows produce empty spans and the
-				// rasterizer writes no pixels there.
-				if(y & 1)
+				// xEnd2: exclusive right edge of the span passed to pixelRoutine.
+				// For full-coverage runs this covers multiple merged quads.
+				int xEnd2;
+
+				if(cMask == 0xF)
 				{
-					local.outline[y - 1] = { 0, 0 };
-					local.outline[y + 2] = { 0, 0 };
+					// Opt 6: merge consecutive full-coverage (cMask=0xF) quads at
+					// the same (primIdx, y) into a single pixelRoutine call that
+					// covers the entire horizontal run.  The work list is sorted by
+					// (primIdx, y, x), so such quads are already adjacent.
+					// Reduces pixelRoutine calls from O(width/2) to O(1) per
+					// interior scanline pair — the dominant case for large triangles.
+					int runEnd = q;
+					while(runEnd + 1 < qEnd
+					      && g_sortedQueue[runEnd + 1].primIdx == item.primIdx
+					      && (int)g_sortedQueue[runEnd + 1].y  == y
+					      && (int)g_sortedQueue[runEnd + 1].x  == (int)g_sortedQueue[runEnd].x + 2
+					      && g_sortedQueue[runEnd + 1].cMask   == 0xF)
+						++runEnd;
+
+					xEnd2 = (int)g_sortedQueue[runEnd].x + 2;
+					local.outline[y].left    = static_cast<uint16_t>(x);
+					local.outline[y].right   = static_cast<uint16_t>(xEnd2);
+					local.outline[y+1].left  = static_cast<uint16_t>(x);
+					local.outline[y+1].right = static_cast<uint16_t>(xEnd2);
+					q = runEnd;  // advance past consumed quads; loop does ++q
+				}
+				else
+				{
+					xEnd2 = x + 2;
+					// Partial coverage: reconstruct per-pixel spans from cMask.
+					// Row y (bits 0, 1)
+					local.outline[y].left   = static_cast<uint16_t>((cMask & 1) ? x     : ((cMask & 2) ? x + 1 : x + 2));
+					local.outline[y].right  = static_cast<uint16_t>((cMask & 2) ? x + 2 : ((cMask & 1) ? x + 1 : x    ));
+					// Row y+1 (bits 2, 3)
+					local.outline[y+1].left  = static_cast<uint16_t>((cMask & 4) ? x     : ((cMask & 8) ? x + 1 : x + 2));
+					local.outline[y+1].right = static_cast<uint16_t>((cMask & 8) ? x + 2 : ((cMask & 4) ? x + 1 : x    ));
 				}
 
-				// Row y (bits 0, 1)
-				local.outline[y].left   = static_cast<uint16_t>((cMask & 1) ? x     : ((cMask & 2) ? x + 1 : x + 2));
-				local.outline[y].right  = static_cast<uint16_t>((cMask & 2) ? x + 2 : ((cMask & 1) ? x + 1 : x    ));
-				// Row y+1 (bits 2, 3)
-				local.outline[y + 1].left  = static_cast<uint16_t>((cMask & 4) ? x     : ((cMask & 8) ? x + 1 : x + 2));
-				local.outline[y + 1].right = static_cast<uint16_t>((cMask & 8) ? x + 2 : ((cMask & 4) ? x + 1 : x    ));
+				// Opt 7: fix odd-y guard spans.  QuadRasterizer::generate() aligns
+				// yMin &= -2 for odd y, producing TWO rasterizer loop iterations:
+				//   iter 0: reads outline[y-1] and outline[y]
+				//   iter 1: reads outline[y+1] and outline[y+2]
+				// Setting guards to {x, x} / {xEnd2, xEnd2} (left == right = empty)
+				// instead of {0, 0} makes the rasterizer start at column x rather
+				// than scanning wastefully from column 0 through x-1.
+				if(y & 1)
+				{
+					local.outline[y - 1] = { static_cast<uint16_t>(x),     static_cast<uint16_t>(x) };
+					local.outline[y + 2] = { static_cast<uint16_t>(xEnd2), static_cast<uint16_t>(xEnd2) };
+				}
 
 				pixelRoutine(device, &local, 1, 0, 1, data);
 			}
